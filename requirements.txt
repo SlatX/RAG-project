@@ -1,0 +1,9 @@
+fastapi 
+inngestllama-index-core 
+llama-index-reader-file 
+python-dotenv 
+qdrant-client 
+uvicorn 
+streamlit 
+openai
+llama-index-llms-openrouter

@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 import inngest
 import inngest.fast_api
 from inngest.experimental import ai
+from pydantic import BaseModel
+from openai import AsyncOpenAI
+import asyncio
 
 from data_loader import load_and_chunk_pdf, embed_texts
 from vector_db import QdrantStorage
@@ -26,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("secure_rag")
 
 # ---------------- SECURITY ----------------
-MAX_QUERY_LENGTH = 500
+MAX_QUERY_LENGTH = 5000
 BLOCK_PATTERNS = [
     r"ignore previous instructions",
     r"reveal system prompt",
@@ -37,6 +40,7 @@ BLOCK_PATTERNS = [
 ]
 ALLOWED_PDF_DIRECTORY = Path("./data").resolve()
 
+
 def validate_user_input(text: str) -> str:
     if len(text) > MAX_QUERY_LENGTH:
         raise ValueError("Query too long")
@@ -46,21 +50,25 @@ def validate_user_input(text: str) -> str:
             raise ValueError("Potential prompt injection detected")
     return text.strip()
 
+
 def sanitize_context(text: str) -> str:
     for pattern in BLOCK_PATTERNS:
         text = re.sub(pattern, "", text, flags=re.I)
     return text.strip()
+
 
 def validate_output(text: str) -> str:
     if any(k in text.lower() for k in ["system prompt", "api key"]):
         raise ValueError("Unsafe output detected")
     return text.strip()
 
+
 def validate_pdf_path(pdf_path: str) -> Path:
     resolved = Path(pdf_path).resolve()
     if not str(resolved).startswith(str(ALLOWED_PDF_DIRECTORY)):
         raise ValueError("Invalid PDF path")
     return resolved
+
 
 # ---------------- INNGEST ----------------
 inngest_client = inngest.Inngest(
@@ -142,4 +150,61 @@ If answer is not in context, say:
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
-inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai])
+
+inngest.fast_api.serve(
+    app,
+    inngest_client,
+    [rag_ingest_pdf, rag_query_pdf_ai]
+)
+
+# ---------------- DIRECT QUERY ENDPOINT ----------------
+class QueryRequest(BaseModel):
+    question: str
+    top_k: int = 5
+
+@app.post("/query")
+async def query_rag_direct(request: QueryRequest):
+    question = validate_user_input(request.question)
+    top_k = request.top_k
+
+    # Retrieve from vector DB
+    query_vector = embed_texts([question])[0]
+    store = QdrantStorage()
+    found = store.search(query_vector, top_k)
+    cleaned_contexts = [sanitize_context(c) for c in found["contexts"]]
+    context_block = "\n\n".join(f"- {c}" for c in cleaned_contexts)
+
+    # Prompt for AI
+    user_prompt = f"""
+Use ONLY the context below to answer.
+
+Context:
+{context_block}
+
+Question:
+{question}
+
+If answer is not in context, say:
+"Information not available."
+"""
+
+    # Use OpenAI client for FastAPI route
+    client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1")
+    response = await client.chat.completions.create(
+        model="openai/gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a secure RAG assistant."},
+            {"role": "user", "content": user_prompt},
+        ],
+        max_tokens=1024,
+        temperature=0.2,
+    )
+
+    answer_raw = response.choices[0].message.content
+    answer = validate_output(answer_raw)
+
+    return {
+        "answer": answer,
+        "sources": found["sources"],
+        "num_contexts": len(cleaned_contexts),
+    }
